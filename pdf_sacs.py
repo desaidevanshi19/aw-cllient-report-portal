@@ -1,316 +1,342 @@
 """
-SACS (Simple Automated Cash Flow System) PDF Generator
-Produces a 2-page PDF:
-  Page 1 — Cash flow bubble diagram  (Inflow → Outflow → Private Reserve)
-  Page 2 — Private Reserve summary detail
+SACS (Simple Automated Cashflow System) PDF Generator
+Matches the actual Windbrook Solutions template:
+  - INFLOW circle (green)     — top-left
+  - OUTFLOW circle (red)      — top-right
+  - PRIVATE RESERVE (blue)    — bottom-center
+  - Red filled arrow          — INFLOW → OUTFLOW (labelled with outflow amount)
+  - Blue L-shaped arrow       — INFLOW ↓→ PRIVATE RESERVE (labelled with excess)
 """
+import math
 from io import BytesIO
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.colors import HexColor, white, black
-from reportlab.lib.units import inch
+from reportlab.lib.colors import HexColor, white
 from reportlab.pdfgen import canvas as rl_canvas
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph
-from reportlab.pdfbase import pdfmetrics
 
-# ── Brand colours ─────────────────────────────────────────────────────────────
-NAVY       = HexColor("#0F2846")
-GREEN      = HexColor("#16A34A")
-GREEN_LIGHT= HexColor("#DCFCE7")
-GREEN_DARK = HexColor("#15803D")
-RED        = HexColor("#DC2626")
-RED_LIGHT  = HexColor("#FEE2E2")
-RED_DARK   = HexColor("#B91C1C")
-BLUE       = HexColor("#2563EB")
-BLUE_LIGHT = HexColor("#DBEAFE")
-BLUE_DARK  = HexColor("#1D4ED8")
-GRAY_LIGHT = HexColor("#F3F4F6")
-GRAY_MID   = HexColor("#9CA3AF")
-GRAY_DARK  = HexColor("#374151")
-BORDER     = HexColor("#E5E7EB")
+# ── Colours ───────────────────────────────────────────────────────────────────
+GREEN_MAIN  = HexColor("#4CAF50")
+GREEN_DARK  = HexColor("#2E7D32")
+GREEN_ARROW = HexColor("#388E3C")
+RED_MAIN    = HexColor("#E53935")
+RED_DARK    = HexColor("#B71C1C")
+BLUE_MAIN   = HexColor("#1976D2")
+BLUE_DARK   = HexColor("#0D47A1")
+BLUE_ARROW  = HexColor("#1565C0")
+NAVY        = HexColor("#0F2846")
+GRAY_TEXT   = HexColor("#374151")
+GRAY_LIGHT  = HexColor("#9CA3AF")
 
 
 def _fmt(n: float) -> str:
-    """Format number as currency string."""
     return f"${n:,.0f}"
 
 
-def _draw_header(c: rl_canvas.Canvas, client, report, width: float, height: float):
-    """Dark navy header bar at the top of every page."""
-    bar_h = 56
-    c.setFillColor(NAVY)
-    c.rect(0, height - bar_h, width, bar_h, fill=1, stroke=0)
+# ── Path helpers ──────────────────────────────────────────────────────────────
 
-    # Company name (left)
-    c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(24, height - 22, "Windbrook Solutions")
-    c.setFont("Helvetica", 8)
-    c.setFillColor(HexColor("#93C5FD"))
-    c.drawString(24, height - 38, "Confidential — Not for Distribution")
-
-    # Client name (centre)
-    full_name = f"{client.first_name} {client.last_name}"
-    if client.is_married and client.spouse_first_name:
-        full_name += f" & {client.spouse_first_name} {client.spouse_last_name}"
-    c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawCentredString(width / 2, height - 26, full_name)
-
-    # Quarter / date (right)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawRightString(width - 24, height - 22, f"{report.quarter} {report.year}")
-    c.setFont("Helvetica", 8)
-    c.setFillColor(HexColor("#93C5FD"))
-    c.drawRightString(width - 24, height - 38, f"Report Date: {report.report_date}")
+def _circle_path(p, cx, cy, r):
+    """Approximate a circle with 4 bezier curves (standard k=0.5523 method)."""
+    k = 0.5523
+    p.moveTo(cx + r, cy)
+    p.curveTo(cx + r,   cy + r*k, cx + r*k, cy + r,   cx,     cy + r)
+    p.curveTo(cx - r*k, cy + r,   cx - r,   cy + r*k, cx - r, cy)
+    p.curveTo(cx - r,   cy - r*k, cx - r*k, cy - r,   cx,     cy - r)
+    p.curveTo(cx + r*k, cy - r,   cx + r,   cy - r*k, cx + r, cy)
+    p.close()
 
 
-def _draw_bubble(
-    c: rl_canvas.Canvas,
-    cx: float, cy: float, r: float,
-    fill_color, border_color,
-    label: str, amount: str,
-    sub_label: str = "",
-):
-    """Draw a coloured circle with centred label and amount."""
-    # Shadow
-    c.setFillColor(HexColor("#D1D5DB"))
-    c.circle(cx + 3, cy - 3, r, fill=1, stroke=0)
+# ── Drawing primitives ────────────────────────────────────────────────────────
+
+def _draw_cash_circle(c, cx, cy, r, main_color, floor_color,
+                      lines, amount_str, show_floor=True):
+    """
+    Draw a SACS-style cash circle.
+    lines      — list of label strings (e.g. ["INFLOW"] or ["PRIVATE","RESERVE"])
+    amount_str — dollar amount shown in white box inside circle
+    show_floor — whether to draw the darker floor section
+    """
     # Main circle
-    c.setFillColor(fill_color)
-    c.setStrokeColor(border_color)
-    c.setLineWidth(2)
-    c.circle(cx, cy, r, fill=1, stroke=1)
-    # Label
+    c.setFillColor(main_color)
+    c.circle(cx, cy, r, fill=1, stroke=0)
+
+    if show_floor:
+        # Darker floor section (bottom ~28% of diameter)
+        c.saveState()
+        clip = c.beginPath()
+        _circle_path(clip, cx, cy, r)
+        c.clipPath(clip, fill=0, stroke=0)
+        floor_h = r * 0.30
+        c.setFillColor(floor_color)
+        c.rect(cx - r - 1, cy - r - 1, 2 * r + 2, floor_h + 1, fill=1, stroke=0)
+        c.restoreState()
+
+        # Dividing line
+        floor_top_y = cy - r + r * 0.30
+        half_chord  = math.sqrt(max(0, r**2 - (floor_top_y - cy)**2))
+        c.setStrokeColor(floor_color)
+        c.setLineWidth(0.8)
+        c.line(cx - half_chord, floor_top_y, cx + half_chord, floor_top_y)
+
+        # "$1,000 Floor" text
+        floor_mid_y = cy - r + (r * 0.30) / 2 - 5
+        c.setFillColor(white)
+        c.setFont("Helvetica-Oblique", 9)
+        c.drawCentredString(cx, floor_mid_y, "$1,000 Floor")
+
+    # Label lines (top portion of circle)
+    total_lines = len(lines)
+    top_y       = cy + r * 0.55
+    line_gap    = 22 if total_lines > 1 else 0
+    start_y     = top_y + (total_lines - 1) * line_gap / 2
     c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawCentredString(cx, cy + r * 0.25, label)
-    # Amount
-    c.setFont("Helvetica-Bold", 16)
-    c.drawCentredString(cx, cy - r * 0.10, amount)
-    # Sub-label
-    if sub_label:
-        c.setFont("Helvetica", 8)
-        c.setFillColor(HexColor("#BFDBFE") if fill_color == BLUE else HexColor("#FCA5A5") if fill_color == RED else HexColor("#86EFAC"))
-        c.drawCentredString(cx, cy - r * 0.38, sub_label)
+    c.setFont("Helvetica-Bold", 20 if r >= 95 else 16)
+    for i, ln in enumerate(lines):
+        c.drawCentredString(cx, start_y - i * line_gap, ln)
+
+    # White amount box
+    box_w = r * 1.4
+    box_h = r * 0.36
+    box_x = cx - box_w / 2
+    box_y = cy - r * 0.25
+    c.setFillColor(white)
+    c.roundRect(box_x, box_y, box_w, box_h, 6, fill=1, stroke=0)
+    c.setFillColor(main_color)
+    c.setFont("Helvetica-Bold", 20 if r >= 95 else 16)
+    c.drawCentredString(cx, box_y + box_h * 0.22, amount_str)
 
 
-def _draw_arrow(c: rl_canvas.Canvas, x1, y, x2, color, label="", strikethrough=False):
-    """Horizontal arrow between two x positions."""
-    c.setStrokeColor(color)
+def _draw_down_arrow(c, cx, tip_y, shaft_len, color):
+    """Solid downward arrow pointing into a circle."""
+    sw, hw, hh = 16, 32, 22
+    top_y = tip_y + hh + shaft_len
     c.setFillColor(color)
-    c.setLineWidth(3)
-    c.line(x1, y, x2 - 8, y)
-    # Arrowhead
     p = c.beginPath()
-    p.moveTo(x2, y)
-    p.lineTo(x2 - 10, y + 5)
-    p.lineTo(x2 - 10, y - 5)
+    p.moveTo(cx - sw/2, top_y)
+    p.lineTo(cx + sw/2, top_y)
+    p.lineTo(cx + sw/2, tip_y + hh)
+    p.lineTo(cx + hw/2, tip_y + hh)
+    p.lineTo(cx,        tip_y)
+    p.lineTo(cx - hw/2, tip_y + hh)
+    p.lineTo(cx - sw/2, tip_y + hh)
     p.close()
     c.drawPath(p, fill=1, stroke=0)
-    if label:
-        c.setFont("Helvetica-Bold", 8)
-        mid = (x1 + x2) / 2
-        c.drawCentredString(mid, y + 7, label)
-    if strikethrough:
-        # Red X
-        c.setStrokeColor(RED_DARK)
-        c.setLineWidth(2)
-        mid = (x1 + x2) / 2
-        c.line(mid - 8, y - 8, mid + 8, y + 8)
-        c.line(mid + 8, y - 8, mid - 8, y + 8)
 
 
-def _draw_summary_box(c: rl_canvas.Canvas, x, y, w, h, title, rows):
-    """
-    Draw a grey summary card.
-    rows = list of (label, value, value_color)
-    """
-    c.setFillColor(GRAY_LIGHT)
-    c.setStrokeColor(BORDER)
-    c.setLineWidth(1)
-    c.roundRect(x, y, w, h, 6, fill=1, stroke=1)
-    # Title bar
-    c.setFillColor(NAVY)
-    c.roundRect(x, y + h - 26, w, 26, 6, fill=1, stroke=0)
-    # Clip the bottom corners of title bar
-    c.setFillColor(NAVY)
-    c.rect(x, y + h - 26, w, 13, fill=1, stroke=0)
+def _draw_right_arrow(c, x1, x2, cy, shaft_h, color, label, sublabel=None):
+    """Solid right-pointing arrow with label."""
+    hh = shaft_h        # half-height of shaft
+    hw = shaft_h * 2.2  # horizontal length of arrowhead
+    sx = x2 - hw        # x where arrowhead starts
+
+    c.setFillColor(color)
+    p = c.beginPath()
+    p.moveTo(x1, cy + hh)
+    p.lineTo(sx, cy + hh)
+    p.lineTo(sx, cy + hh * 2.2)
+    p.lineTo(x2, cy)
+    p.lineTo(sx, cy - hh * 2.2)
+    p.lineTo(sx, cy - hh)
+    p.lineTo(x1, cy - hh)
+    p.close()
+    c.drawPath(p, fill=1, stroke=0)
+
+    # Label inside shaft
+    mid_x = (x1 + sx) / 2
     c.setFillColor(white)
+    c.setFont("Helvetica-Bold", 10)
+    c.drawCentredString(mid_x, cy - 5, label)
+
+    if sublabel:
+        c.setFillColor(GRAY_TEXT)
+        c.setFont("Helvetica-Oblique", 8)
+        c.drawCentredString(mid_x, cy - hh - 14, sublabel)
+
+
+def _draw_l_arrow(c, vert_x, top_y, corner_y, end_x, color, label):
+    """
+    Hollow L-shaped arrow:
+      — goes DOWN from (vert_x, top_y) to (vert_x, corner_y)
+      — turns RIGHT to (end_x, corner_y) with arrowhead
+    """
+    t  = 14    # pipe thickness (half)
+    aw = 20    # arrowhead horizontal length
+    ah = 22    # arrowhead half-width
+
+    c.setFillColor(color)
+    p = c.beginPath()
+    # Outer contour going clockwise:
+    p.moveTo(vert_x - t, top_y)              # top-left of vertical
+    p.lineTo(vert_x - t, corner_y + t)       # bottom-left outer
+    p.lineTo(end_x - aw, corner_y + t)       # right end of bottom
+    p.lineTo(end_x - aw, corner_y + ah)      # arrowhead bottom wing
+    p.lineTo(end_x,      corner_y)           # arrowhead tip
+    p.lineTo(end_x - aw, corner_y - ah)      # arrowhead top wing
+    p.lineTo(end_x - aw, corner_y - t)       # right end of top
+    p.lineTo(vert_x + t, corner_y - t)       # inner corner
+    p.lineTo(vert_x + t, top_y)              # top-right of vertical
+    p.close()
+    c.drawPath(p, fill=1, stroke=0)
+
+    # Label below the horizontal segment
+    mid_x = (vert_x + (end_x - aw)) / 2
+    c.setFillColor(color)
     c.setFont("Helvetica-Bold", 9)
-    c.drawCentredString(x + w / 2, y + h - 17, title.upper())
-    # Rows
-    row_h = (h - 32) / max(len(rows), 1)
-    for i, (label, value, vcolor) in enumerate(rows):
-        ry = y + h - 32 - (i + 1) * row_h + row_h * 0.3
-        c.setFillColor(GRAY_DARK)
-        c.setFont("Helvetica", 8)
-        c.drawString(x + 10, ry, label)
-        c.setFillColor(vcolor if vcolor else GRAY_DARK)
-        c.setFont("Helvetica-Bold", 9)
-        c.drawRightString(x + w - 10, ry, value)
+    c.drawCentredString(mid_x, corner_y - t - 13, label)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def generate_sacs_pdf(client, report, calculations: dict) -> bytes:
     """
-    Generate the SACS PDF and return raw bytes.
+    Generate the SACS PDF matching the actual template.
 
     Args:
-        client  — SQLAlchemy Client ORM object
-        report  — SQLAlchemy Report ORM object
-        calculations — dict from calculations.calculate_report()
+        client        — SQLAlchemy Client ORM object
+        report        — SQLAlchemy Report ORM object (has .inflow, .outflow,
+                        .private_reserve_balance, .quarter, .year, .report_date)
+        calculations  — dict from calculations.calculate_report()
     """
     buf = BytesIO()
     W, H = letter  # 612 × 792
-    c = rl_canvas.Canvas(buf, pagesize=letter)
+    c   = rl_canvas.Canvas(buf, pagesize=letter)
 
     excess     = calculations["excess"]
     pr_target  = calculations["private_reserve_target"]
     pr_balance = report.private_reserve_balance
 
-    # ── PAGE 1: Cash Flow Diagram ─────────────────────────────────────────────
-    _draw_header(c, client, report, W, H)
+    full_name = f"{client.first_name} {client.last_name}"
+    if client.is_married and client.spouse_first_name:
+        full_name += f" & {client.spouse_first_name} {client.spouse_last_name}"
 
-    # Section title
+    # ── Page white background ─────────────────────────────────────────────────
+    c.setFillColor(white)
+    c.rect(0, 0, W, H, fill=1, stroke=0)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    # Green $ icon
+    c.setFillColor(GREEN_MAIN)
+    c.setFont("Helvetica-Bold", 38)
+    c.drawString(22, H - 52, "$")
+
+    # Title
     c.setFillColor(NAVY)
-    c.setFont("Helvetica-Bold", 16)
-    c.drawCentredString(W / 2, H - 80, "Simple Automated Cash Flow System")
-    c.setFillColor(GRAY_MID)
+    c.setFont("Helvetica-Bold", 20)
+    c.drawCentredString(W / 2, H - 36, "Simple Automated Cashflow System (SACS)")
+
+    # Client name subtitle
+    c.setFont("Helvetica-Bold", 13)
+    c.setFillColor(GRAY_TEXT)
+    c.drawCentredString(W / 2, H - 57, full_name)
+
+    # Salary labels (green, top-left)
+    c.setFillColor(GREEN_MAIN)
     c.setFont("Helvetica", 9)
-    c.drawCentredString(W / 2, H - 96, "Monthly Cash Flow Overview")
+    c.drawString(22, H - 74, f"{_fmt(report.inflow)} — Monthly Inflow")
+    c.drawString(22, H - 88, f"{_fmt(report.outflow)} — Monthly Outflow")
+
+    # "X = Monthly Expenses" annotation (top-right)
+    c.setFillColor(GRAY_TEXT)
+    c.setFont("Helvetica", 8)
+    c.drawRightString(W - 22, H - 58, "X = Monthly Expenses")
+
+    # Quarter / date (top-right lower)
+    c.setFillColor(GRAY_LIGHT)
+    c.setFont("Helvetica", 8)
+    c.drawRightString(W - 22, H - 72, f"{report.quarter} {report.year}  |  {report.report_date}")
 
     # Divider
-    c.setStrokeColor(BORDER)
-    c.setLineWidth(1)
-    c.line(40, H - 104, W - 40, H - 104)
+    c.setStrokeColor(HexColor("#E5E7EB"))
+    c.setLineWidth(0.8)
+    c.line(18, H - 96, W - 18, H - 96)
 
-    # Three main bubbles
-    bubble_y = H - 290
-    bubble_r = 82
-    spacing  = 170
-    cx1 = W / 2 - spacing        # Inflow
-    cx2 = W / 2                  # Outflow
-    cx3 = W / 2 + spacing        # Private Reserve
+    # ── Circle geometry ───────────────────────────────────────────────────────
+    r    = 100   # radius for INFLOW / OUTFLOW
+    r_pr = 85    # radius for PRIVATE RESERVE
 
-    _draw_bubble(c, cx1, bubble_y, bubble_r, GREEN, GREEN_DARK,
-                 "MONTHLY INFLOW", _fmt(report.inflow), "Monthly Salary")
+    cy_top = 480  # y-centre for INFLOW / OUTFLOW
+    cy_bot = 245  # y-centre for PRIVATE RESERVE
 
-    _draw_bubble(c, cx2, bubble_y, bubble_r, RED, RED_DARK,
-                 "MONTHLY OUTFLOW", _fmt(report.outflow), "Expense Budget")
+    cx_in  = 162         # INFLOW centre-x
+    cx_out = W - 162     # OUTFLOW centre-x  (= 450)
+    cx_pr  = W / 2       # PRIVATE RESERVE centre-x (= 306)
 
-    _draw_bubble(c, cx3, bubble_y, bubble_r, BLUE, BLUE_DARK,
-                 "PRIVATE RESERVE", _fmt(pr_balance), "Current Balance")
+    # ── Green down-arrow into INFLOW ──────────────────────────────────────────
+    _draw_down_arrow(c, cx_in, cy_top + r + 2, 38, GREEN_ARROW)
 
-    # Arrows
-    gap = 10
-    _draw_arrow(c, cx1 + bubble_r + gap, bubble_y + 12, cx2 - bubble_r - gap, GREEN,
-                label="Salary Deposit")
-    _draw_arrow(c, cx2 + bubble_r + gap, bubble_y + 12, cx3 - bubble_r - gap, BLUE,
-                label=f"Excess {_fmt(excess)}")
-    # Strike-through on outflow arrow (money going out)
-    _draw_arrow(c, cx1 + bubble_r + gap, bubble_y - 12, cx2 - bubble_r - gap, RED,
-                strikethrough=True)
+    # ── INFLOW circle ─────────────────────────────────────────────────────────
+    _draw_cash_circle(c, cx_in, cy_top, r, GREEN_MAIN, GREEN_DARK,
+                      ["INFLOW"], _fmt(report.inflow), show_floor=True)
 
-    # Floor note
-    c.setFillColor(GRAY_MID)
-    c.setFont("Helvetica-Oblique", 8)
-    c.drawCentredString(W / 2, bubble_y - bubble_r - 22,
-                        "* $1,000 floor balance maintained in each bank account")
+    # ── OUTFLOW circle ────────────────────────────────────────────────────────
+    _draw_cash_circle(c, cx_out, cy_top, r, RED_MAIN, RED_DARK,
+                      ["OUTFLOW"], _fmt(report.outflow), show_floor=True)
 
-    # ── Summary cards (lower section) ────────────────────────────────────────
-    card_y  = 80
-    card_h  = 150
-    card_w  = 160
-    gap_c   = 20
-    total_w = 3 * card_w + 2 * gap_c
-    start_x = (W - total_w) / 2
+    # ── Red filled arrow INFLOW → OUTFLOW ─────────────────────────────────────
+    ax1 = cx_in  + r + 10
+    ax2 = cx_out - r - 10
+    _draw_right_arrow(c, ax1, ax2, cy_top, 16, RED_MAIN,
+                      f"X = {_fmt(report.outflow)}/month*",
+                      "Automated transfer on the 28th")
 
-    excess_color = GREEN if excess >= 0 else RED
-    excess_str   = (f"+{_fmt(excess)}" if excess >= 0 else _fmt(excess))
+    # ── PRIVATE RESERVE circle ────────────────────────────────────────────────
+    _draw_cash_circle(c, cx_pr, cy_bot, r_pr, BLUE_MAIN, BLUE_DARK,
+                      ["PRIVATE", "RESERVE"], _fmt(pr_balance), show_floor=False)
 
-    _draw_summary_box(c, start_x, card_y, card_w, card_h, "Cash Flow", [
-        ("Monthly Inflow",  _fmt(report.inflow),   GREEN),
-        ("Monthly Outflow", _fmt(report.outflow),  RED),
-        ("Monthly Excess",  excess_str,             excess_color),
-    ])
+    # ── Blue L-arrow INFLOW ↓→ PRIVATE RESERVE ───────────────────────────────
+    lx  = cx_in - 36                 # x of vertical segment (left of INFLOW)
+    ly0 = cy_top - r - 10            # top of vertical (just below INFLOW)
+    lye = cy_bot                     # corner / end y (level with PR centre)
+    lx2 = cx_pr - r_pr - 10         # end x (left edge of PR circle)
+    _draw_l_arrow(c, lx, ly0, lye, lx2, BLUE_ARROW,
+                  f"{_fmt(excess)}/mo*")
 
-    _draw_summary_box(c, start_x + card_w + gap_c, card_y, card_w, card_h, "Private Reserve", [
-        ("Current Balance", _fmt(pr_balance),      BLUE),
-        ("Target Balance",  _fmt(pr_target),       NAVY),
-        ("Status", "✓ On Track" if pr_balance >= pr_target else "Below Target",
-         GREEN if pr_balance >= pr_target else RED),
-    ])
-
-    _draw_summary_box(c, start_x + 2 * (card_w + gap_c), card_y, card_w, card_h, "Annualised", [
-        ("Annual Inflow",   _fmt(report.inflow * 12),  GREEN),
-        ("Annual Outflow",  _fmt(report.outflow * 12), RED),
-        ("Annual Excess",   _fmt(excess * 12),          excess_color),
-    ])
-
-    # Footer
-    c.setFillColor(GRAY_MID)
-    c.setFont("Helvetica", 7)
-    c.drawCentredString(W / 2, 28,
-        f"Windbrook Solutions  |  {client.first_name} {client.last_name}  |  "
-        f"{report.quarter} {report.year}  |  Confidential")
-
-    # ── PAGE 2: Private Reserve Detail ───────────────────────────────────────
-    c.showPage()
-    _draw_header(c, client, report, W, H)
-
+    # ── "MONTHLY CASHFLOW" label below PRIVATE RESERVE ───────────────────────
     c.setFillColor(NAVY)
-    c.setFont("Helvetica-Bold", 16)
-    c.drawCentredString(W / 2, H - 80, "Private Reserve Detail")
-    c.setStrokeColor(BORDER)
-    c.line(40, H - 94, W - 40, H - 94)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawCentredString(cx_pr, cy_bot - r_pr - 22, "MONTHLY CASHFLOW")
 
-    detail_rows = [
-        ("Monthly Inflow (take-home salary)",    _fmt(report.inflow),     GRAY_DARK),
-        ("Monthly Outflow (agreed expense budget)", _fmt(report.outflow),  GRAY_DARK),
-        ("Monthly Excess (Inflow – Outflow)",    excess_str,               excess_color),
-        ("",                                      "",                       GRAY_DARK),
-        ("Private Reserve Current Balance",       _fmt(pr_balance),         BLUE),
-        ("Private Reserve Target (6× expenses)",  _fmt(pr_target),          NAVY),
-        ("Difference (Balance – Target)",
-            _fmt(pr_balance - pr_target),
-            GREEN if pr_balance >= pr_target else RED),
+    # Dashed vertical line below label (matches template detail)
+    c.setStrokeColor(GRAY_LIGHT)
+    c.setLineWidth(0.6)
+    c.setDash(3, 3)
+    c.line(cx_pr, cy_bot - r_pr - 36, cx_pr, cy_bot - r_pr - 70)
+    c.setDash()
+
+    # ── Summary strip at bottom ───────────────────────────────────────────────
+    strip_y = 48
+    strip_h = 44
+    c.setFillColor(HexColor("#F8FAFC"))
+    c.setStrokeColor(HexColor("#E5E7EB"))
+    c.setLineWidth(0.5)
+    c.rect(18, strip_y, W - 36, strip_h, fill=1, stroke=1)
+
+    col_w = (W - 36) / 3
+    items = [
+        ("Monthly Excess",        _fmt(excess),     GREEN_MAIN if excess >= 0 else RED_MAIN),
+        ("Private Reserve",       _fmt(pr_balance),  BLUE_MAIN),
+        ("Target",                _fmt(pr_target),   NAVY),
     ]
+    for i, (lbl, val, col) in enumerate(items):
+        x = 18 + col_w * i + col_w / 2
+        c.setFillColor(GRAY_TEXT)
+        c.setFont("Helvetica", 7)
+        c.drawCentredString(x, strip_y + strip_h - 14, lbl)
+        c.setFillColor(col)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawCentredString(x, strip_y + 8, val)
 
-    row_y = H - 130
-    for label, value, vcolor in detail_rows:
-        if not label:
-            c.setStrokeColor(BORDER)
-            c.line(60, row_y + 8, W - 60, row_y + 8)
-            row_y -= 14
-            continue
-        c.setFillColor(GRAY_DARK)
-        c.setFont("Helvetica", 10)
-        c.drawString(60, row_y, label)
-        c.setFillColor(vcolor)
-        c.setFont("Helvetica-Bold", 10)
-        c.drawRightString(W - 60, row_y, value)
-        row_y -= 28
+    # Vertical separators in strip
+    c.setStrokeColor(HexColor("#E5E7EB"))
+    c.setLineWidth(0.5)
+    for i in (1, 2):
+        sx = 18 + col_w * i
+        c.line(sx, strip_y + 4, sx, strip_y + strip_h - 4)
 
-    # Large target progress bar
-    bar_x, bar_y, bar_w, bar_bh = 60, row_y - 60, W - 120, 28
-    pct = min(pr_balance / pr_target, 1.0) if pr_target > 0 else 0
+    # ── Footer ────────────────────────────────────────────────────────────────
     c.setFillColor(GRAY_LIGHT)
-    c.setStrokeColor(BORDER)
-    c.roundRect(bar_x, bar_y, bar_w, bar_bh, 4, fill=1, stroke=1)
-    c.setFillColor(GREEN if pct >= 1.0 else BLUE)
-    c.roundRect(bar_x, bar_y, bar_w * pct, bar_bh, 4, fill=1, stroke=0)
-    c.setFillColor(white)
-    c.setFont("Helvetica-Bold", 9)
-    c.drawCentredString(bar_x + bar_w / 2, bar_y + 9, f"{pct * 100:.0f}% funded")
-
-    # Footer
-    c.setFillColor(GRAY_MID)
     c.setFont("Helvetica", 7)
-    c.drawCentredString(W / 2, 28,
-        f"Windbrook Solutions  |  {client.first_name} {client.last_name}  |  "
-        f"{report.quarter} {report.year}  |  Confidential")
+    c.drawCentredString(W / 2, 26,
+        f"Windbrook Solutions  |  {full_name}  |  {report.quarter} {report.year}  |  Confidential")
+    c.drawCentredString(W / 2, 14, "* Amounts may be rounded. Floor = $1,000 minimum maintained in each account.")
 
     c.save()
     return buf.getvalue()
